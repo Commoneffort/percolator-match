@@ -29,6 +29,22 @@ Example with oracle price of 100,000:
 - Bid: 99,500
 - Ask: 100,500
 
+### vAMM impact
+
+The vAMM kind adds impact on top of spread and fee. Impact is priced along the LP's
+per-asset inventory, not per request: marginal impact at LP exposure `e` is
+`min(cap, 2 × impact_k_bps × notional(e) / liquidity_notional_e6)`, and a fill pays the
+average of that curve over the exposure it adds. A fill from a flat book pays
+`impact_k_bps × notional(fill) / liquidity_notional_e6`, as before, but splitting an order
+walks the same curve and cannot be cheaper than the aggregate (rounding always goes against
+the taker). The portion of a fill that reduces existing LP exposure pays no impact.
+
+### Inventory
+
+Inventory is tracked per asset (up to 6 assets with nonzero inventory at once; a slot frees
+when its asset returns to flat). `max_inventory_abs` caps each asset separately, all
+arithmetic is checked, and a fill in a seventh asset gets a zero fill.
+
 ## Building
 
 ```bash
@@ -57,9 +73,9 @@ The compiled program is output to `target/deploy/percolator_match.so`.
 | Offset | Field | Size | Description |
 |--------|-------|------|-------------|
 | 0-63 | return | 64 | Matcher return data (written on each call) - ABI required |
-| 64-95 | lp_pda | 32 | Stored LP PDA (set on init, verified on calls) |
+| 64-319 | matcher state | 256 | Configuration, stored LP PDA, per-asset inventory |
 
-Minimum size: 96 bytes (percolator requires 320 bytes)
+Minimum size: 320 bytes.
 
 ## Instructions
 
@@ -134,25 +150,40 @@ Each leg (26 bytes):
 
 ### Tag 2: Initialize
 
-Stores the LP PDA in the context account. Does not require PDA signature (passive init). Can only be called once.
+Stores the LP PDA and parameters in the context account. The context account must sign
+(it is a fresh keypair created in the same transaction), so a third party cannot bind
+someone else's context. The LP PDA does not sign: it is the wrapper's matcher delegate and
+can only sign through the wrapper's `invoke_signed`. Init only succeeds on a context region
+that was never written; a context with any existing header, including the pre-`44d4cfa`
+legacy magic, is refused.
 
 #### Accounts
 
 | Index | Name | Type | Description |
 |-------|------|------|-------------|
 | 0 | lp_pda | - | LP PDA to store (no signature required) |
-| 1 | matcher_ctx | Writable | Context account owned by this program |
+| 1 | matcher_ctx | Signer, Writable | Context account owned by this program |
 
-#### Instruction Data (1 byte)
+#### Instruction Data (66 bytes)
 
 | Offset | Field | Type | Description |
 |--------|-------|------|-------------|
 | 0 | tag | u8 | Always 2 |
+| 1 | kind | u8 | 0=Passive, 1=vAMM |
+| 2-6 | trading_fee_bps | u32 | Trading fee in basis points |
+| 6-10 | base_spread_bps | u32 | Base spread in basis points |
+| 10-14 | max_total_bps | u32 | Maximum total spread/fee/impact |
+| 14-18 | impact_k_bps | u32 | vAMM impact multiplier, 0 for passive |
+| 18-34 | liquidity_notional_e6 | u128 | vAMM depth (≤ u64::MAX), 0 for passive |
+| 34-50 | max_fill_abs | u128 | Maximum absolute fill per call |
+| 50-66 | max_inventory_abs | u128 | Maximum absolute inventory per asset (≤ i128::MAX), 0 for no limit |
 
 ## Security
 
 - **LP PDA binding**: The matcher verifies that the LP PDA signer matches the PDA stored during initialization
-- **One-time init**: Context can only be initialized once (prevents rebinding)
+- **Authorized init**: The context account must sign tag 2
+- **One-time init**: Context can only be initialized once, and never over existing bytes (prevents rebinding)
+- **Upgrade migration**: Version-3 contexts are read as version 4 with their single inventory assigned to asset 0
 - **Program ownership**: Context account must be owned by this program
 
 ## License
