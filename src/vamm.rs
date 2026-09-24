@@ -57,8 +57,29 @@ pub const MATCHER_VERSION: u32 = 4;
 /// Version 3 contexts kept one context-wide inventory scalar; it is migrated to asset 0 on read.
 pub const MATCHER_VERSION_V3: u32 = 3;
 
-/// Number of distinct assets a context can hold nonzero inventory in at the same time.
-pub const MATCHER_MAX_ASSETS: usize = 6;
+/// Per-asset inventory slots stored inside the 256-byte context region.
+pub const MATCHER_INLINE_ASSETS: usize = 6;
+/// Additional per-asset slots an enlarged context account can carry after byte 320.
+pub const MATCHER_TAIL_MAX_ASSETS: usize = 26;
+/// Upper bound on distinct assets with nonzero inventory in one context.
+pub const MATCHER_MAX_ASSETS: usize = MATCHER_INLINE_ASSETS + MATCHER_TAIL_MAX_ASSETS;
+/// Context-relative offset of the optional inventory tail (account offset 320).
+pub const MATCHER_TAIL_OFFSET: usize = CTX_VAMM_LEN;
+const MATCHER_TAIL_HEADER_LEN: usize = 4;
+const MATCHER_TAIL_ENTRY_LEN: usize = 18;
+/// Account length that carries every tail slot. A plain 320-byte context holds six assets; an
+/// LP quoting more assets at once (up to a portfolio's 16) allocates a larger context.
+pub const MATCHER_CONTEXT_LEN_FULL: usize =
+    MATCHER_CONTEXT_LEN + MATCHER_TAIL_HEADER_LEN + MATCHER_TAIL_MAX_ASSETS * MATCHER_TAIL_ENTRY_LEN;
+
+/// Tail slots available in a context region of `ctx_region_len` bytes (account length - 64).
+pub fn matcher_tail_capacity(ctx_region_len: usize) -> usize {
+    ctx_region_len
+        .saturating_sub(MATCHER_TAIL_OFFSET + MATCHER_TAIL_HEADER_LEN)
+        .checked_div(MATCHER_TAIL_ENTRY_LEN)
+        .unwrap_or(0)
+        .min(MATCHER_TAIL_MAX_ASSETS)
+}
 
 /// Unified matcher context stored at offset 64 in matcher context account
 ///
@@ -80,10 +101,18 @@ pub const MATCHER_MAX_ASSETS: usize = 6;
 /// 112     8     last_oracle_price_e6
 /// 120     8     last_exec_price_e6
 /// 128     16    max_inventory_abs (per asset)
-/// 144     1     asset_slots_used (bitmap over the 6 inventory slots)
+/// 144     1     inline slots used (bitmap over the 6 inline inventory slots)
 /// 145     3     _pad1
-/// 148     12    asset_ids ([u16; 6])
-/// 160     96    asset_inventory ([i128; 6])
+/// 148     12    inline asset ids ([u16; 6])
+/// 160     96    inline asset inventory ([i128; 6])
+/// ```
+///
+/// Optional tail (context-relative offset 256, account offset 320), present when the account
+/// is larger than 320 bytes:
+/// ```text
+/// 0       4     tail slots used (bitmap, bit j = tail slot j)
+/// 4+18j   2     asset id of tail slot j
+/// 6+18j   16    inventory of tail slot j
 /// ```
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -130,18 +159,22 @@ pub struct MatcherCtx {
     /// Maximum absolute inventory per asset (0 = no limit)
     pub max_inventory_abs: u128, // 16 bytes, offset 128
 
-    // ---- Per-asset inventory (112 bytes) ----
-    /// Bit i set when slot i holds an asset
-    pub asset_slots_used: u8, // 1 byte, offset 144
-    pub _pad1: [u8; 3], // 3 bytes, offset 145
+    // ---- Per-asset inventory (serialized inline at offset 144 and in the optional tail) ----
+    /// Bit i set when slot i holds an asset (slots 0..6 inline, 6.. in the tail)
+    pub asset_slots_used: u32,
+    pub _pad1: [u8; 3],
     /// Asset index held by each slot
-    pub asset_ids: [u16; MATCHER_MAX_ASSETS], // 12 bytes, offset 148
+    pub asset_ids: [u16; MATCHER_MAX_ASSETS],
     /// LP inventory in base units for each slot
-    pub asset_inventory: [i128; MATCHER_MAX_ASSETS], // 96 bytes, offset 160
+    pub asset_inventory: [i128; MATCHER_MAX_ASSETS],
+    /// Tail slots this context's account can store (runtime only, from the account length)
+    pub tail_capacity: u8,
 }
 
-// Compile-time size check
-const _: () = assert!(core::mem::size_of::<MatcherCtx>() == CTX_VAMM_LEN);
+// The serialized fixed region is 256 bytes (see read_from/write_to); the inline inventory
+// table must end exactly there.
+const _: () = assert!(160 + MATCHER_INLINE_ASSETS * 16 == CTX_VAMM_LEN);
+const _: () = assert!(MATCHER_MAX_ASSETS <= 32);
 
 impl Default for MatcherCtx {
     fn default() -> Self {
@@ -165,6 +198,7 @@ impl Default for MatcherCtx {
             _pad1: [0; 3],
             asset_ids: [0; MATCHER_MAX_ASSETS],
             asset_inventory: [0; MATCHER_MAX_ASSETS],
+            tail_capacity: 0,
         }
     }
 }
@@ -232,15 +266,35 @@ impl MatcherCtx {
             ..Self::default()
         };
 
+        ctx.tail_capacity = matcher_tail_capacity(data.len()) as u8;
         match version {
             MATCHER_VERSION => {
-                ctx.asset_slots_used = data[144];
-                for i in 0..MATCHER_MAX_ASSETS {
+                if data[144] >> MATCHER_INLINE_ASSETS != 0 {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                ctx.asset_slots_used = u32::from(data[144]);
+                for i in 0..MATCHER_INLINE_ASSETS {
                     let id = 148 + i * 2;
                     ctx.asset_ids[i] = u16::from_le_bytes(data[id..id + 2].try_into().unwrap());
                     let inv = 160 + i * 16;
                     ctx.asset_inventory[i] =
                         i128::from_le_bytes(data[inv..inv + 16].try_into().unwrap());
+                }
+                let tail_cap = ctx.tail_capacity as usize;
+                if tail_cap != 0 {
+                    let t = MATCHER_TAIL_OFFSET;
+                    let tail_used = u32::from_le_bytes(data[t..t + 4].try_into().unwrap());
+                    if tail_used >> tail_cap != 0 {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                    ctx.asset_slots_used |= tail_used << MATCHER_INLINE_ASSETS;
+                    for j in 0..tail_cap {
+                        let e = t + MATCHER_TAIL_HEADER_LEN + j * MATCHER_TAIL_ENTRY_LEN;
+                        let i = MATCHER_INLINE_ASSETS + j;
+                        ctx.asset_ids[i] = u16::from_le_bytes(data[e..e + 2].try_into().unwrap());
+                        ctx.asset_inventory[i] =
+                            i128::from_le_bytes(data[e + 2..e + 18].try_into().unwrap());
+                    }
                 }
             }
             MATCHER_VERSION_V3 => {
@@ -280,13 +334,28 @@ impl MatcherCtx {
         data[112..120].copy_from_slice(&self.last_oracle_price_e6.to_le_bytes());
         data[120..128].copy_from_slice(&self.last_exec_price_e6.to_le_bytes());
         data[128..144].copy_from_slice(&self.max_inventory_abs.to_le_bytes());
-        data[144] = self.asset_slots_used;
+        data[144] = (self.asset_slots_used & ((1 << MATCHER_INLINE_ASSETS) - 1)) as u8;
         data[145..148].copy_from_slice(&self._pad1);
-        for i in 0..MATCHER_MAX_ASSETS {
+        for i in 0..MATCHER_INLINE_ASSETS {
             let id = 148 + i * 2;
             data[id..id + 2].copy_from_slice(&self.asset_ids[i].to_le_bytes());
             let inv = 160 + i * 16;
             data[inv..inv + 16].copy_from_slice(&self.asset_inventory[i].to_le_bytes());
+        }
+        let tail_cap = (self.tail_capacity as usize).min(matcher_tail_capacity(data.len()));
+        let tail_used = self.asset_slots_used >> MATCHER_INLINE_ASSETS;
+        if tail_used >> tail_cap != 0 {
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+        if tail_cap != 0 {
+            let t = MATCHER_TAIL_OFFSET;
+            data[t..t + 4].copy_from_slice(&tail_used.to_le_bytes());
+            for j in 0..tail_cap {
+                let e = t + MATCHER_TAIL_HEADER_LEN + j * MATCHER_TAIL_ENTRY_LEN;
+                let i = MATCHER_INLINE_ASSETS + j;
+                data[e..e + 2].copy_from_slice(&self.asset_ids[i].to_le_bytes());
+                data[e + 2..e + 18].copy_from_slice(&self.asset_inventory[i].to_le_bytes());
+            }
         }
 
         Ok(())
@@ -310,8 +379,12 @@ impl MatcherCtx {
         }
     }
 
+    fn slot_count(&self) -> usize {
+        MATCHER_INLINE_ASSETS + self.tail_capacity as usize
+    }
+
     fn find_asset_slot(&self, asset_index: u16) -> Option<usize> {
-        (0..MATCHER_MAX_ASSETS)
+        (0..self.slot_count())
             .find(|&i| self.asset_slots_used & (1 << i) != 0 && self.asset_ids[i] == asset_index)
     }
 
@@ -319,7 +392,7 @@ impl MatcherCtx {
     /// free slot exists.
     fn can_hold_asset(&self, asset_index: u16) -> bool {
         self.find_asset_slot(asset_index).is_some()
-            || self.asset_slots_used.count_ones() < MATCHER_MAX_ASSETS as u32
+            || (self.asset_slots_used.count_ones() as usize) < self.slot_count()
     }
 
     /// Apply the LP side of a fill (`exec_size` is the taker's signed size) with checked
@@ -328,7 +401,7 @@ impl MatcherCtx {
         let slot = match self.find_asset_slot(asset_index) {
             Some(i) => i,
             None => {
-                let i = (0..MATCHER_MAX_ASSETS)
+                let i = (0..self.slot_count())
                     .find(|&i| self.asset_slots_used & (1 << i) == 0)
                     .ok_or(ProgramError::InvalidArgument)?;
                 self.asset_slots_used |= 1 << i;
@@ -1353,7 +1426,7 @@ mod tests {
     #[test]
     fn test_full_asset_table_zero_fills_new_asset() {
         let mut ctx = default_passive_ctx();
-        for asset in 0..MATCHER_MAX_ASSETS as u16 {
+        for asset in 0..MATCHER_INLINE_ASSETS as u16 {
             ctx.apply_fill(asset, 10).unwrap();
         }
         let mut call = make_call(1_000_000, 10);
@@ -1461,5 +1534,40 @@ mod tests {
             assert!(widening_mul(q - 1, d) < prod);
         }
         assert!(mul_div_ceil(u128::MAX, u128::MAX, 1).is_err());
+    }
+
+    /// An enlarged context carries 32 slots; they survive a write/read round trip.
+    #[test]
+    fn test_inventory_tail_round_trip_and_capacity() {
+        let mut buf = alloc::vec![0u8; MATCHER_CONTEXT_LEN_FULL - CTX_VAMM_OFFSET];
+        let mut ctx = default_passive_ctx();
+        ctx.tail_capacity = matcher_tail_capacity(buf.len()) as u8;
+        assert_eq!(ctx.tail_capacity as usize, MATCHER_TAIL_MAX_ASSETS);
+        for asset in 0..MATCHER_MAX_ASSETS as u16 {
+            ctx.apply_fill(100 + asset, -(i128::from(asset) + 1)).unwrap();
+        }
+        let mut call = make_call(1_000_000, 1);
+        call.asset_index = 999;
+        assert_eq!(compute_execution(&ctx, &call).unwrap().1, 0, "table full");
+        ctx.write_to(&mut buf).unwrap();
+        let back = MatcherCtx::read_from(&buf).unwrap();
+        for asset in 0..MATCHER_MAX_ASSETS as u16 {
+            assert_eq!(back.asset_inventory(100 + asset), i128::from(asset) + 1);
+        }
+        // A plain 320-byte context sees only its six inline slots.
+        assert_eq!(matcher_tail_capacity(MATCHER_CONTEXT_LEN - CTX_VAMM_OFFSET), 0);
+        // Sixteen portfolio assets fit in a context sized for ten tail slots.
+        let sixteen = MATCHER_CONTEXT_LEN + 4 + 10 * 18 - CTX_VAMM_OFFSET;
+        assert_eq!(matcher_tail_capacity(sixteen), 10);
+    }
+
+    /// A tail bitmap claiming slots the account cannot hold is rejected.
+    #[test]
+    fn test_inventory_tail_rejects_out_of_range_bits() {
+        let mut buf = alloc::vec![0u8; MATCHER_CONTEXT_LEN + 4 + 18 - CTX_VAMM_OFFSET];
+        let ctx = default_passive_ctx();
+        ctx.write_to(&mut buf).unwrap();
+        buf[MATCHER_TAIL_OFFSET..MATCHER_TAIL_OFFSET + 4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(MatcherCtx::read_from(&buf).is_err());
     }
 }

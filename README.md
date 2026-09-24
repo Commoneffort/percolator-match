@@ -41,9 +41,10 @@ the taker). The portion of a fill that reduces existing LP exposure pays no impa
 
 ### Inventory
 
-Inventory is tracked per asset (up to 6 assets with nonzero inventory at once; a slot frees
-when its asset returns to flat). `max_inventory_abs` caps each asset separately, all
-arithmetic is checked, and a fill in a seventh asset gets a zero fill.
+Inventory is tracked per asset. A 320-byte context holds 6 assets with nonzero inventory at
+once; a context allocated at `MATCHER_CONTEXT_LEN_FULL` (792 bytes) carries a tail with 26 more
+slots, enough for every asset a portfolio can hold. A slot frees when its asset returns to flat. `max_inventory_abs` caps each asset separately, all
+arithmetic is checked, and a fill in an asset beyond the table gets a zero fill.
 
 ## Building
 
@@ -73,9 +74,10 @@ The compiled program is output to `target/deploy/percolator_match.so`.
 | Offset | Field | Size | Description |
 |--------|-------|------|-------------|
 | 0-63 | return | 64 | Matcher return data (written on each call) - ABI required |
-| 64-319 | matcher state | 256 | Configuration, stored LP PDA, per-asset inventory |
+| 64-319 | matcher state | 256 | Configuration, stored LP PDA, 6 inline inventory slots |
+| 320-791 | inventory tail | 472 | Optional: slot bitmap + 26 × (asset u16, inventory i128) |
 
-Minimum size: 320 bytes.
+Minimum size: 320 bytes (6 assets). Full size: 792 bytes (32 assets).
 
 ## Instructions
 
